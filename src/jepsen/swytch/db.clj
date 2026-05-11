@@ -1,60 +1,73 @@
 (ns jepsen.swytch.db
-  "Jepsen DB lifecycle for Swytch: installs the binary, generates certs
-  and cluster config, starts/stops the process, and collects logs."
+  "Jepsen DB lifecycle for Swytch: installs the binary, starts/stops
+  the chosen transport (redis or sql), and collects logs.
+
+  Cluster bootstrap uses swytch's beacon subsystem: every node starts
+  with --cluster-passphrase and --join pointing at a DNS name that
+  resolves to the cluster's peer IPs. DNS is managed out-of-band by
+  the operator (see :join-dns test option); jepsen does not distribute
+  certs or a static topology file."
   (:require [clojure.tools.logging :refer [info warn]]
             [clojure.string :as str]
             [jepsen [control :as c]
-                    [db :as db]
-                    [util :as util]]
-            [jepsen.control.util :as cu]
-            [jepsen.os.debian :as debian]
-            [jepsen.swytch.cert :as cert]
-            [jepsen.swytch.cluster-config :as cc])
+                    [db :as db]]
+            [jepsen.control.util :as cu])
   (:import [java.io File]))
 
-(def swytch-dir   "/opt/swytch")
-(def binary       (str swytch-dir "/swytch"))
-(def keygen-bin   (str swytch-dir "/noise-keygen"))
-(def pid-file     (str swytch-dir "/swytch.pid"))
-(def log-file     (str swytch-dir "/swytch.log"))
-(def effects-path (str swytch-dir "/data/effects.log"))
-(def tiplog-path  (str swytch-dir "/data/tiplog"))
-(def data-dir     (str swytch-dir "/data"))
+(def swytch-dir     "/opt/swytch")
+(def binary         (str swytch-dir "/swytch"))
+(def pid-file       (str swytch-dir "/swytch.pid"))
+(def log-file       (str swytch-dir "/swytch.log"))
+(def data-dir       (str swytch-dir "/data"))
 
-(def redis-port 6379)
-(def cluster-port 7000)
+;; Transport defaults — `:port` is the client-facing listen port,
+;; `:cluster-port` is the QUIC port peers dial to each other.
+(def transports
+  {:redis {:port         6379
+           :cluster-port 7379
+           :subcommand   "redis"}
+   :sql   {:port         5433
+           :cluster-port 6433
+           :subcommand   "sql"}})
+
+(defn transport-config
+  "Resolves transport configuration from a test opts map. :transport
+  is either :redis or :sql; defaults to :redis."
+  [test]
+  (let [t (keyword (or (:transport test) :redis))]
+    (or (get transports t)
+        (throw (ex-info (str "unknown transport: " t)
+                        {:available (keys transports)})))))
+
+;; ---- Build ----
 
 (defn build-swytch!
-  "Builds the Swytch binary and noise-keygen locally from source.
-  Returns a map of {:swytch path, :noise-keygen path}."
+  "Builds the Swytch binary locally from source. Returns the path."
   [source-dir]
   (let [source-dir (str source-dir)]
     (info "Building Swytch from" source-dir)
-    (let [swytch-out (str source-dir "/swytch")
-          keygen-out (str source-dir "/noise-keygen")
-          env        {"GOOS" "linux" "GOARCH" "amd64" "CGO_ENABLED" "0"}
-          run!       (fn [& args]
-                       (let [pb (ProcessBuilder. (into-array String args))
-                             pe (.environment pb)]
-                         (.directory pb (File. source-dir))
-                         (doseq [[k v] env] (.put pe k v))
-                         (.redirectErrorStream pb true)
-                         (let [p  (.start pb)
-                               out (slurp (.getInputStream p))
-                               rc  (.waitFor p)]
-                           (when (not= 0 rc)
-                             (throw (ex-info (str "Build failed: " out)
-                                            {:exit rc :output out}))))))]
-      (run! "go" "build" "--tags" "nolicense" "-o" swytch-out ".")
-      (run! "go" "build" "-o" keygen-out "./cmd/noise-keygen/main.go")
-      (info "Build complete")
-      {:swytch       swytch-out
-       :noise-keygen keygen-out})))
+    (let [out-path (str source-dir "/swytch")
+          env      {"GOOS" "linux" "GOARCH" "amd64" "CGO_ENABLED" "0"}
+          run!     (fn [& args]
+                     (let [pb ^ProcessBuilder (ProcessBuilder. ^"[Ljava.lang.String;" (into-array String args))
+                           pe (.environment pb)]
+                       (.directory pb (File. source-dir))
+                       (doseq [[k v] env] (.put pe k v))
+                       (.redirectErrorStream pb true)
+                       (let [p   (.start pb)
+                             out (slurp (.getInputStream p))
+                             rc  (.waitFor p)]
+                         (when (not= 0 rc)
+                           (throw (ex-info (str "Build failed: " out)
+                                           {:exit rc :output out}))))))]
+      (run! "go" "build" "--tags" "nolicense" "-o" out-path ".")
+      (info "Build complete:" out-path)
+      {:swytch out-path})))
 
 (defn local-md5
   "Returns the md5 hex digest of a local file."
   [path]
-  (let [md (java.security.MessageDigest/getInstance "MD5")
+  (let [md  (java.security.MessageDigest/getInstance "MD5")
         buf (byte-array 8192)]
     (with-open [is (java.io.FileInputStream. (str path))]
       (loop []
@@ -65,55 +78,129 @@
     (apply str (map #(format "%02x" %) (.digest md)))))
 
 (defn install-binary!
-  "Stops any running swytch, uploads the binary and noise-keygen to the
-  node, and verifies the remote binary matches the local build via md5."
+  "Stops any running swytch, uploads the binary, and verifies it
+  matches the local build via md5."
   [test]
   (c/su
-    ;; Stop the running process first — can't overwrite a running binary
     (cu/stop-daemon! binary pid-file)
     (c/exec :rm :-f binary)
     (c/exec :mkdir :-p swytch-dir)
     (c/exec :mkdir :-p data-dir)
     (c/upload (:swytch-binary test) binary)
     (c/exec :chmod "+x" binary)
-    ;; Verify the upload matches the local build
     (let [local-hash  (local-md5 (:swytch-binary test))
           remote-hash (first (str/split (c/exec :md5sum binary) #"\s+"))]
       (when (not= local-hash remote-hash)
         (throw (ex-info "Binary mismatch after upload!"
                         {:local  local-hash
                          :remote remote-hash
-                         :binary binary}))))
-    (when-let [kg (:noise-keygen-binary test)]
-      (c/upload kg keygen-bin)
-      (c/exec :chmod "+x" keygen-bin))))
+                         :binary binary}))))))
+
+;; ---- /etc/hosts injection ----
+
+;; Marker lines around a swytch-managed block. Keeps modifications
+;; scoped so we can idempotently replace them on restart and strip
+;; them on teardown without trashing a hand-written /etc/hosts.
+(def hosts-begin-marker "# BEGIN jepsen-swytch")
+(def hosts-end-marker   "# END jepsen-swytch")
+
+(defn install-hosts!
+  "Writes /etc/hosts entries on this node so `join-dns` resolves to
+  every node IP regardless of what the upstream DNS provider returns.
+  Some managed-DNS providers truncate A-record responses below the
+  record count; libc's /etc/hosts lookup runs before DNS (nsswitch
+  `files dns`) so injecting here is the authoritative path.
+
+  Idempotent: strips any prior swytch-managed block before writing."
+  [test join-dns]
+  (when (and join-dns (not (str/blank? join-dns)))
+    (c/su
+      (c/exec :sed :-i
+              (str "/" hosts-begin-marker "/," "/" hosts-end-marker "/d")
+              "/etc/hosts")
+      (let [block (str "\n" hosts-begin-marker "\n"
+                       (str/join "\n"
+                                 (for [ip (sort (:nodes test))]
+                                   (str ip " " join-dns)))
+                       "\n" hosts-end-marker "\n")]
+        (c/exec :bash :-c
+                (str "cat >> /etc/hosts <<'HOSTSEOF'\n" block "HOSTSEOF"))))))
+
+(defn uninstall-hosts!
+  "Removes the swytch-managed block from /etc/hosts."
+  []
+  (c/su
+    (c/exec :sed :-i
+            (str "/" hosts-begin-marker "/," "/" hosts-end-marker "/d")
+            "/etc/hosts")))
+
+;; ---- Start / stop ----
+
+(defn resolve-passphrase!
+  "Obtains the cluster passphrase. Priority:
+
+   1. --cluster-passphrase on the jepsen CLI (test opts :cluster-passphrase)
+   2. Test atom :cluster-passphrase (first node to reach this sets it)
+   3. Generate one via `swytch gen-passphrase` and share via atom
+
+  Generation happens on the first node (by sorted name) so every
+  other node waits and reads the shared value."
+  [test node]
+  (or (:cluster-passphrase test)
+      (when-let [atm (:cluster-passphrase-atom test)]
+        (let [first-node (first (sort (:nodes test)))]
+          (if (= node first-node)
+            (or @atm
+                (let [pass (-> (c/exec binary "gen-passphrase")
+                               str/trim)]
+                  (info "generated cluster passphrase on" node)
+                  (reset! atm pass)
+                  pass))
+            (loop [tries 60]
+              (if-let [pass @atm]
+                pass
+                (if (zero? tries)
+                  (throw (RuntimeException. "timed out waiting for cluster passphrase"))
+                  (do (Thread/sleep 1000)
+                      (recur (dec tries)))))))))))
 
 (defn start-swytch!
-  "Starts the Swytch process on this node."
+  "Starts the Swytch process on this node. Transport is picked from
+  the test's :transport option (default :redis)."
   [test node]
-  (let [node-id (cc/node->id test node)
-        base-args ["redis"
-                   "--port"                (str redis-port)
-                   "--bind"                "0.0.0.0"
-                   "--maxmemory"           "5gb"
-                   "--node-id"             (str node-id)
-                   "--effects-path"        "memory"
-                   "--tip-log-path"        tiplog-path
-                   "--config"              cc/config-path
-                   "--cluster-cert-file"   (str cert/cert-dir "/" node "-cert.pem")
-                   "--cluster-key-file"    (str cert/cert-dir "/" node "-key.pem")
-                   "--cluster-ca-cert-file" (str cert/cert-dir "/ca.pem")
-                   "--log-format"          "json"]
-        args (if (:debug test)
-               (into ["redis" "--debug"] (rest base-args))
-               base-args)]
-    (info "Starting Swytch on" node "with node-id" node-id)
+  (let [cfg         (transport-config test)
+        subcommand  (:subcommand cfg)
+        port        (get-in test [:port-override] (:port cfg))
+        cluster-port (:cluster-port cfg)
+        passphrase  (resolve-passphrase! test node)
+        join-dns    (:join-dns test)
+        base-args   (case subcommand
+                      "redis"
+                      ["redis"
+                       "--port"                (str port)
+                       "--bind"                "0.0.0.0"
+                       "--maxmemory"           "5gb"
+                       "--log-format"          "json"
+                       "--cluster-passphrase"  passphrase
+                       "--cluster-port"        (str cluster-port)]
+                      "sql"
+                      ["sql"
+                       "--listen"              (str "0.0.0.0:" port)
+                       "--log-format"          "json"
+                       "--cluster-passphrase"  passphrase
+                       "--cluster-port"        (str cluster-port)])
+        base-args   (cond-> base-args
+                      join-dns     (into ["--join" join-dns])
+                      (:debug test) (into ["-v"]))]
+    (info "Starting Swytch" subcommand "on" node
+          "port" port "cluster-port" cluster-port
+          "join" join-dns)
     (apply cu/start-daemon!
       {:logfile log-file
        :pidfile pid-file
        :chdir   swytch-dir}
       binary
-      args)))
+      base-args)))
 
 (defn stop-swytch!
   "Stops the Swytch process."
@@ -121,110 +208,43 @@
   (cu/stop-daemon! binary pid-file))
 
 (defn wipe-data!
-  "Removes effects log, tiplog, and any other data files."
+  "Removes the data dir."
   []
   (c/su
     (c/exec :rm :-rf data-dir)
     (c/exec :mkdir :-p data-dir)))
 
-(defn setup-certs!
-  "Sets up TLS certificates for the cluster. The first node generates
-  the CA, then distributes it to all other nodes. Each node generates
-  its own node cert signed by the CA."
-  [test node]
-  (let [first-node (first (sort (:nodes test)))]
-    (if (= node first-node)
-      ;; First node: generate CA
-      (do
-        (info "Generating CA on" node)
-        (cert/gen-ca!)
-        ;; Store CA material in test atom for other nodes
-        (let [ca-cert (cert/read-file (str cert/cert-dir "/ca.pem"))
-              ca-key  (cert/read-file (str cert/cert-dir "/ca-key.pem"))]
-          (swap! (:ca-material test) assoc :cert ca-cert :key ca-key)))
-      ;; Other nodes: wait for CA, then install it
-      (do
-        (info "Waiting for CA material on" node)
-        (util/await-fn
-          (fn [] (when-not (:cert @(:ca-material test))
-                   (throw (RuntimeException. "CA not ready yet"))))
-          {:retry-interval 1000
-           :log-interval   5000
-           :log-message    "Waiting for CA cert..."
-           :timeout        30000})
-        (let [{:keys [cert key]} @(:ca-material test)]
-          (cert/install-ca-from! cert key))))
-    ;; Every node: generate its own node cert
-    (info "Generating node cert for" node)
-    (cert/gen-node-cert! node)))
+;; ---- DB lifecycle ----
 
-(defn setup-cluster-config!
-  "Generates noise keys and writes cluster.yml on this node.
-  The first node collects all noise keys, generates the config,
-  and stores it in the test atom. Other nodes wait and install."
-  [test node]
-  (let [first-node (first (sort (:nodes test)))
-        ;; Every node derives its own noise key
-        nkey (cc/noise-public-key node)]
-    ;; Store this node's noise key
-    (swap! (:noise-keys test) assoc node nkey)
-    (info "Node" node "noise key:" nkey)
-
-    (if (= node first-node)
-      ;; First node: wait for all keys, then generate config
-      (do
-        (util/await-fn
-          (fn [] (when (< (count @(:noise-keys test)) (count (:nodes test)))
-                   (throw (RuntimeException. "Not all noise keys collected"))))
-          {:retry-interval 1000
-           :log-interval   5000
-           :log-message    "Waiting for noise keys..."
-           :timeout        60000})
-        (let [config (cc/gen-cluster-config test @(:noise-keys test))]
-          (swap! (:cluster-config test) (constantly config))
-          (cc/install-config! config)))
-      ;; Other nodes: wait for config
-      (do
-        (util/await-fn
-          (fn [] (when-not @(:cluster-config test)
-                   (throw (RuntimeException. "Cluster config not ready"))))
-          {:retry-interval 1000
-           :log-interval   5000
-           :log-message    "Waiting for cluster config..."
-           :timeout        60000})
-        (cc/install-config! @(:cluster-config test))))))
-
-(defrecord SwytchDB [swytch-binary noise-keygen-binary]
+(defrecord SwytchDB [swytch-binary]
   db/DB
   (setup! [this test node]
-    ;; Build once (first node to reach this point builds; others wait)
     (locking build-swytch!
       (when (and (:swytch-source test)
                  (not (:swytch-binary test))
                  (not @(:built? test)))
-        (let [bins (build-swytch! (:swytch-source test))]
-          (swap! (:test-opts test) assoc
-                 :swytch-binary       (:swytch bins)
-                 :noise-keygen-binary (:noise-keygen bins))
+        (let [{:keys [swytch]} (build-swytch! (:swytch-source test))]
+          (swap! (:test-opts test) assoc :swytch-binary swytch)
           (reset! (:built? test) true))))
-    ;; Use built paths if available
     (let [test (if-let [opts @(:test-opts test)]
                  (merge test opts)
                  test)]
       (wipe-data!)
       (c/su (c/exec :rm :-f log-file))
       (install-binary! test)
-      (setup-certs! test node)
-      (setup-cluster-config! test node)
+      (install-hosts! test (:join-dns test))
       (start-swytch! test node)
+      ;; Brief sleep so peers have a chance to handshake before we
+      ;; accept clients — swytch's session-init path calls
+      ;; ensureSubscribed, which refuses to proceed in a "minority
+      ;; partition." A few seconds on a LAN is typically enough once
+      ;; DNS (via /etc/hosts) resolves to the full member set.
       (Thread/sleep 5000)))
 
   (teardown! [this test node]
     (stop-swytch!)
-    (wipe-data!)
-    (c/su
-      (c/exec :rm :-rf cert/cert-dir)
-      (c/exec :rm :-rf cc/config-dir)))
+    (uninstall-hosts!)
+    (wipe-data!))
 
   db/Kill
   (kill! [this test node]
@@ -247,9 +267,15 @@
     [log-file]))
 
 (defn db
-  "Constructs a SwytchDB instance. Options:
-
-    :swytch-binary         - path to local swytch binary to upload
-    :noise-keygen-binary   - path to local noise-keygen binary to upload"
+  "Constructs a SwytchDB instance. Reads :swytch-binary if supplied;
+  otherwise the first node that reaches setup! builds it."
   [opts]
-  (map->SwytchDB (select-keys opts [:swytch-binary :noise-keygen-binary])))
+  (map->SwytchDB (select-keys opts [:swytch-binary])))
+
+;; ---- Compatibility shims for the existing client code ----
+
+;; The redis client grabbed `sdb/redis-port` as a compile-time
+;; constant. Keep it for backwards compatibility even though the
+;; transports map is the canonical source.
+(def redis-port (get-in transports [:redis :port]))
+(def sql-port   (get-in transports [:sql   :port]))
