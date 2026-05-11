@@ -22,6 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
         rsync \
         unzip \
+        gnuplot-nox \
+        graphviz \
     && rm -rf /var/lib/apt/lists/*
 
 # Controller-role tooling (JDK + leiningen + go). Worker pods don't
