@@ -33,4 +33,5 @@ exec lein run test \
     --nemesis-config "$JEPSEN_NEMESIS" \
     --join-dns "$JEPSEN_JOIN_DNS" \
     --time-limit "$JEPSEN_TIME_LIMIT" \
-    --swytch-binary "$SWYTCH_BINARY"
+    --swytch-binary "$SWYTCH_BINARY" \
+    --debug
