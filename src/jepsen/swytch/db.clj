@@ -104,6 +104,27 @@
 (def hosts-begin-marker "# BEGIN jepsen-swytch")
 (def hosts-end-marker   "# END jepsen-swytch")
 
+;; /etc/hosts inside Kubernetes pods is a bind mount managed by
+;; kubelet. The file itself is writable, but `rename(2)` onto the
+;; mount point fails with EBUSY — which is what `sed -i` and any
+;; other write-temp-then-rename pattern do under the hood. We have
+;; to overwrite in place: build the new content in a temp file,
+;; then `cat tmp > /etc/hosts` to truncate-and-write the existing
+;; inode without renaming.
+(defn- rewrite-hosts!
+  "Runs `sed -e EXPR ...` over /etc/hosts and writes the result
+  back in place. Extra shell snippets in `extra-script` run against
+  the temp file before it's copied over /etc/hosts (used by install
+  to append the swytch block)."
+  [sed-expr extra-script]
+  (c/exec :bash :-c
+          (str "set -eu\n"
+               "tmp=$(mktemp)\n"
+               "trap 'rm -f \"$tmp\"' EXIT\n"
+               "sed -e " (pr-str sed-expr) " /etc/hosts > \"$tmp\"\n"
+               (or extra-script "")
+               "cat \"$tmp\" > /etc/hosts\n")))
+
 (defn install-hosts!
   "Writes /etc/hosts entries on this node so `join-dns` resolves to
   every node IP regardless of what the upstream DNS provider returns.
@@ -115,24 +136,23 @@
   [test join-dns]
   (when (and join-dns (not (str/blank? join-dns)))
     (c/su
-      (c/exec :sed :-i
-              (str "/" hosts-begin-marker "/," "/" hosts-end-marker "/d")
-              "/etc/hosts")
       (let [block (str "\n" hosts-begin-marker "\n"
                        (str/join "\n"
                                  (for [ip (sort (:nodes test))]
                                    (str ip " " join-dns)))
-                       "\n" hosts-end-marker "\n")]
-        (c/exec :bash :-c
-                (str "cat >> /etc/hosts <<'HOSTSEOF'\n" block "HOSTSEOF"))))))
+                       "\n" hosts-end-marker "\n")
+            append (str "cat >> \"$tmp\" <<'HOSTSEOF'\n" block "HOSTSEOF\n")]
+        (rewrite-hosts!
+          (str "/" hosts-begin-marker "/,/" hosts-end-marker "/d")
+          append)))))
 
 (defn uninstall-hosts!
   "Removes the swytch-managed block from /etc/hosts."
   []
   (c/su
-    (c/exec :sed :-i
-            (str "/" hosts-begin-marker "/," "/" hosts-end-marker "/d")
-            "/etc/hosts")))
+    (rewrite-hosts!
+      (str "/" hosts-begin-marker "/,/" hosts-end-marker "/d")
+      nil)))
 
 ;; ---- Start / stop ----
 
