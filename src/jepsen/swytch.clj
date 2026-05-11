@@ -17,14 +17,19 @@
             [jepsen.swytch.workload.counter :as counter]
             [jepsen.swytch.workload.elle-causal :as elle-causal]
             [jepsen.swytch.workload.set :as set-wl]
-            [jepsen.swytch.workload.sorted-set :as sorted-set]))
+            [jepsen.swytch.workload.sorted-set :as sorted-set]
+            [jepsen.swytch.workload.sql-append :as sql-append]))
 
 (def workloads
-  "Map of workload names to constructor functions."
-  {:counter      counter/workload
-   :set          set-wl/workload
-   :sorted-set   sorted-set/workload
-   :elle-causal  elle-causal/workload})
+  "Map of workload names to {:transport :fn}. :transport tells the
+  DB layer which swytch subcommand to launch. Redis and SQL
+  workloads cannot share a cluster within one run — they're
+  different front-ends to the same storage model, so tests pick one."
+  {:counter      {:transport :redis :fn counter/workload}
+   :set          {:transport :redis :fn set-wl/workload}
+   :sorted-set   {:transport :redis :fn sorted-set/workload}
+   :elle-causal  {:transport :redis :fn elle-causal/workload}
+   :sql-append   {:transport :sql   :fn sql-append/workload}})
 
 (def nemesis-configs
   "Map of nemesis configuration names to constructor functions.
@@ -37,20 +42,23 @@
    :safe        (fn [db] (sn/safe-nemesis db))})
 
 (defn swytch-test
-  "Constructs a Jepsen test map for Swytch."
+  "Constructs a Jepsen test map for Swytch. The chosen workload
+  determines the transport (redis or sql) the DB layer will start
+  on each node."
   [opts]
-  (let [ca-material     (atom {})
-        noise-keys      (atom {})
-        cluster-config  (atom nil)
-        built?          (atom false)
-        test-opts       (atom nil)
-        db              (sdb/db opts)
-        workload-name   (keyword (:workload opts "counter"))
-        workload-fn     (get workloads workload-name)
-        _               (when-not workload-fn
-                          (throw (ex-info (str "Unknown workload: " workload-name)
-                                         {:available (keys workloads)})))
-        workload        (workload-fn opts)
+  (let [built?                  (atom false)
+        test-opts               (atom nil)
+        cluster-passphrase-atom (atom (:cluster-passphrase opts))
+        workload-name           (keyword (:workload opts "counter"))
+        workload-entry          (get workloads workload-name)
+        _                       (when-not workload-entry
+                                  (throw (ex-info (str "Unknown workload: " workload-name)
+                                                 {:available (keys workloads)})))
+        transport               (:transport workload-entry)
+        workload-fn             (:fn workload-entry)
+        opts                    (assoc opts :transport transport)
+        db                      (sdb/db opts)
+        workload                (workload-fn opts)
         nemesis-name    (keyword (:nemesis-config opts "safe"))
         nemesis-fn      (get nemesis-configs nemesis-name)
         _               (when-not nemesis-fn
@@ -74,19 +82,24 @@
                                   [fs (:nemesis fault-pkg)])])))]
     (merge tests/noop-test
            opts
-           {:name           (str "swytch-" (name workload-name))
-            :os             swytch-os/os
-            :db             db
-            :ca-material    ca-material
-            :noise-keys     noise-keys
-            :cluster-config cluster-config
-            :built?         built?
-            :test-opts      test-opts
-            :client         (or (:client workload) (swytch-client/client))
+           {:name                    (str "swytch-" (name workload-name))
+            :os                      swytch-os/os
+            :db                      db
+            :transport               transport
+            :built?                  built?
+            :test-opts               test-opts
+            :cluster-passphrase-atom cluster-passphrase-atom
+            :client                  (or (:client workload)
+                                         (case transport
+                                           :redis (swytch-client/client)
+                                           :sql   (throw (ex-info
+                                                          "SQL workloads must provide their own :client"
+                                                          {:workload workload-name}))))
             :nemesis        combined-nemesis
             :checker        (checker/compose
                               (merge
-                                {:timeline             (timeline/html)
+                                {:perf                 (checker/perf)
+                                 :timeline             (timeline/html)
                                  :workload             (:checker workload)
                                  :availability         (sc/availability-checker)}
                                 (when (not= nemesis-name :none)
@@ -105,15 +118,17 @@
 (def cli-opts
   "Additional CLI options for Swytch tests."
   [[nil "--swytch-source PATH" "Path to Swytch source directory (builds automatically)"
-    :default "../cloxcache"]
+    :default "../swytch"]
    [nil "--swytch-binary PATH" "Path to a pre-built Swytch binary (skips build)"
     :default nil]
-   [nil "--noise-keygen-binary PATH" "Path to a pre-built noise-keygen binary"
-    :default nil]
-   [nil "--workload NAME" "Workload to run: counter, set, sorted-set, elle-causal"
+   [nil "--workload NAME" "Workload to run: counter, set, sorted-set, elle-causal, sql-append"
     :default "counter"]
    [nil "--nemesis-config NAME" "Nemesis config: none, safe"
     :default "safe"]
+   [nil "--join-dns DNSNAME" "DNS name peers resolve to discover each other. Operator-managed."
+    :default nil]
+   [nil "--cluster-passphrase PASS" "Shared passphrase for cluster mTLS. When unset, the test generates one and shares it across nodes."
+    :default nil]
    [nil "--rate NUM" "Ops per second"
     :default 100
     :parse-fn #(Long/parseLong %)
