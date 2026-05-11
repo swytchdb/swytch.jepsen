@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Worker entrypoint: install the mounted authorized_keys for root and
+# start sshd in the foreground. The Secret is mounted read-only at
+# /etc/jepsen/keys/authorized_keys by the workflow.
+set -euo pipefail
+
+KEYS_SRC=/etc/jepsen/keys/authorized_keys
+KEYS_DST=/root/.ssh/authorized_keys
+
+if [[ ! -s "$KEYS_SRC" ]]; then
+    echo "run-sshd: $KEYS_SRC missing or empty; refusing to start" >&2
+    exit 1
+fi
+
+install -m 0700 -d /root/.ssh
+install -m 0600 "$KEYS_SRC" "$KEYS_DST"
+
+ssh-keygen -A
+exec /usr/sbin/sshd -D -e

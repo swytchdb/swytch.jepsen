@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Controller entrypoint. Inputs (env):
+#   JEPSEN_REF           — optional git ref to check out before running
+#   JEPSEN_NODES         — required, CSV of node hostnames/IPs
+#   JEPSEN_WORKLOAD      — required (counter, set, sorted-set, elle-causal, ...)
+#   JEPSEN_NEMESIS       — required (none, safe)
+#   JEPSEN_TIME_LIMIT    — required, seconds
+#   JEPSEN_JOIN_DNS      — required, the synthetic peer DNS name
+#   SWYTCH_BINARY        — required, path to the prebuilt linux/amd64 swytch binary
+#   SSH_PRIVATE_KEY_PATH — required, path to the SSH key matching the workers' authorized_keys
+set -euo pipefail
+
+cd /opt/jepsen
+
+if [[ -n "${JEPSEN_REF:-}" ]]; then
+    git fetch --depth=1 origin "$JEPSEN_REF"
+    git checkout FETCH_HEAD
+    lein deps
+fi
+
+: "${JEPSEN_NODES:?required}"
+: "${JEPSEN_WORKLOAD:?required}"
+: "${JEPSEN_NEMESIS:?required}"
+: "${JEPSEN_TIME_LIMIT:?required}"
+: "${JEPSEN_JOIN_DNS:?required}"
+: "${SWYTCH_BINARY:?required}"
+: "${SSH_PRIVATE_KEY_PATH:?required}"
+
+exec lein run test \
+    --nodes "$JEPSEN_NODES" \
+    --ssh-private-key "$SSH_PRIVATE_KEY_PATH" \
+    --workload "$JEPSEN_WORKLOAD" \
+    --nemesis-config "$JEPSEN_NEMESIS" \
+    --join-dns "$JEPSEN_JOIN_DNS" \
+    --time-limit "$JEPSEN_TIME_LIMIT" \
+    --swytch-binary "$SWYTCH_BINARY"
