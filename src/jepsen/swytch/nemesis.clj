@@ -5,14 +5,13 @@
   no Swytch Cloud. The nemesis injects:
     - Network partitions (majority split, single-node isolation)
     - Single-node kill/restart (process crash + recovery)
-    - Clock skew (HLC absorption)
 
   Constraints from design.md:
     - Do NOT kill a node while partitioned — it's a cache, not a
       database, so data on that node is lost forever.
     - Kill/restart runs ONLY during normal operation (before partitions).
 
-  Uses phased scheduling: normal → kill → settle → partition/clock → heal → settle → final-read."
+  Uses phased scheduling: normal → kill → settle → partition → heal → settle → final-read."
   (:require [clojure.tools.logging :refer [info]]
             [jepsen [generator :as gen]
                     [nemesis :as n]
@@ -127,23 +126,25 @@
 
 (defn swytch-nemesis-packages
   "Returns a collection of nemesis packages for the given opts.
-  Uses Swytch's custom partition nemesis instead of the default."
+  Uses Swytch's custom partition nemesis instead of the default.
+
+  Note: no clock-skew package — swytch doesn't depend on wall-clock
+  time, and `ntpdate -b` requires CAP_SYS_TIME which the K8s test
+  pods don't have."
   [opts]
   (let [faults (set (:faults opts))
         opts   (assoc opts :faults faults)]
     [(swytch-partition-package opts)
-     (nc/clock-package opts)
      (nc/db-package opts)]))
 
 (defn nemesis-package
   "Composes all nemesis packages into one. Options:
 
     :db         The SwytchDB instance
-    :faults     Set of enabled faults, e.g. #{:partition :kill :clock}
+    :faults     Set of enabled faults, e.g. #{:partition :kill}
     :interval   Seconds between nemesis operations (default 10)
     :partition  {:targets [...]}  — partition specs to use
-    :kill       {:targets [...]}
-    :clock      {:targets [...]}"
+    :kill       {:targets [...]}"
   [opts]
   (nc/compose-packages (swytch-nemesis-packages opts)))
 
@@ -154,13 +155,13 @@
     1. Normal operation (no faults) for `normal-secs`
     2. Kill a random node + client ops for a brief window, then heal
     3. Settle after kill for `settle-secs`
-    4. Fault injection (partitions, clock skew) for `fault-secs`
+    4. Fault injection (partitions) for `fault-secs`
     5. Heal all faults
     6. Settle for `settle-secs` (normal ops, no faults)
     7. Final reads
 
   `kill-pkg` is a nemesis package for kill/restart (run before partitions).
-  `fault-pkg` is a nemesis package for partitions + clock skew.
+  `fault-pkg` is a nemesis package for partitions.
   `client-gen` is the generator for client operations.
   Either package may be nil to skip that phase."
   [{:keys [normal-secs fault-secs settle-secs]
@@ -188,7 +189,7 @@
       (gen/clients
         (gen/time-limit settle-secs client-gen)))
 
-    ;; Phase 5: partition/clock faults + client ops
+    ;; Phase 5: partition faults + client ops
     (when (:generator fault-pkg)
       (->> client-gen
            (gen/nemesis (:generator fault-pkg))
@@ -217,7 +218,6 @@
   Includes:
     - Single-node kill/restart during normal phase (tests crash recovery)
     - Majority/minority partitions during fault phase (tests reachability-based write rules)
-    - Clock skew during fault phase (tests HLC absorption)
 
   Constraints:
     - Kill happens ONLY before partitions — killing a partitioned cache
@@ -231,6 +231,5 @@
                 :kill   {:targets [:one]}})
    :fault-pkg (nemesis-package
                 {:db        db
-                 :faults    #{:partition :clock}
-                 :partition {:targets [:one :majority]}
-                 :clock     {:targets [:one]}})})
+                 :faults    #{:partition}
+                 :partition {:targets [:one :majority]}})})
