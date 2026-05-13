@@ -33,13 +33,22 @@
 
 (def nemesis-configs
   "Map of nemesis configuration names to constructor functions.
-  Phase 1: only :none and :safe are available (single-region, no Cloud)."
-  {:none        (fn [_] {:kill-pkg  nil
-                         :fault-pkg {:nemesis         nemesis/noop
-                                     :generator       nil
-                                     :final-generator nil
-                                     :perf            #{}}})
-   :safe        (fn [db] (sn/safe-nemesis db))})
+
+  :none      — no faults; baseline.
+  :safe      — single-node kill/restart followed by partitions.
+  :attrition — sequentially kill nodes until one survives, hold, then
+               revive. Stresses bootstrap with a single authoritative
+               source. The constructor receives `opts` (not just `db`)
+               because the schedule consults `:nodes` at op-emission
+               time. swytch-test below routes attrition through an
+               alternative phase generator."
+  {:none        (fn [_db _opts] {:kill-pkg  nil
+                                 :fault-pkg {:nemesis         nemesis/noop
+                                             :generator       nil
+                                             :final-generator nil
+                                             :perf            #{}}})
+   :safe        (fn [db _opts] (sn/safe-nemesis db))
+   :attrition   (fn [db  opts] (sn/attrition-nemesis db opts))})
 
 (defn swytch-test
   "Constructs a Jepsen test map for Swytch. The chosen workload
@@ -64,7 +73,7 @@
         _               (when-not nemesis-fn
                           (throw (ex-info (str "Unknown nemesis config: " nemesis-name)
                                          {:available (keys nemesis-configs)})))
-        nemesis-pkg     (nemesis-fn db)
+        nemesis-pkg     (nemesis-fn db opts)
         ;; safe-nemesis returns {:kill-pkg ... :fault-pkg ...}
         ;; :none returns a simple package — wrap it for compatibility
         kill-pkg        (:kill-pkg nemesis-pkg)
@@ -104,13 +113,20 @@
                                  :availability         (sc/availability-checker)}
                                 (when (not= nemesis-name :none)
                                   {:partition-effective (sc/partition-effective-checker)})))
-            :generator      (sn/phase-generator
-                              {:normal-secs (:normal-secs opts 10)
-                               :fault-secs  (:fault-secs opts 30)
-                               :settle-secs (:settle-secs opts 30)}
-                              nemesis-pkg
-                              (:generator workload)
-                              (:final-generator workload))
+            :generator      (if (= nemesis-name :attrition)
+                              (sn/attrition-phase-generator
+                                {:normal-secs (:normal-secs opts 20)
+                                 :settle-secs (:settle-secs opts 30)}
+                                nemesis-pkg
+                                (:generator workload)
+                                (:final-generator workload))
+                              (sn/phase-generator
+                                {:normal-secs (:normal-secs opts 10)
+                                 :fault-secs  (:fault-secs opts 30)
+                                 :settle-secs (:settle-secs opts 30)}
+                                nemesis-pkg
+                                (:generator workload)
+                                (:final-generator workload)))
             :perf           (into #{} (concat (:perf kill-pkg) (:perf fault-pkg)))})))
 
 ;; ---- CLI ----
@@ -123,7 +139,7 @@
     :default nil]
    [nil "--workload NAME" "Workload to run: counter, set, sorted-set, elle-causal, sql-append"
     :default "counter"]
-   [nil "--nemesis-config NAME" "Nemesis config: none, safe"
+   [nil "--nemesis-config NAME" "Nemesis config: none, safe, attrition"
     :default "safe"]
    [nil "--join-dns DNSNAME" "DNS name peers resolve to discover each other. Operator-managed."
     :default nil]

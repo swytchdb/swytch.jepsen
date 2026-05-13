@@ -233,3 +233,108 @@
                 {:db        db
                  :faults    #{:partition}
                  :partition {:targets [:one :majority]}})})
+
+;; ---- Attrition: kills nodes one at a time until one survives, then revives ----
+;;
+;; Stresses cluster formation under the harshest realistic scenario: a
+;; single surviving node must remain consistent through the survivor
+;; phase and serve as the sole authoritative source when revived nodes
+;; bootstrap. This is the rolling-upgrade pattern that historically
+;; triggered ghost-tip propagation bugs in ensureSubscribed.
+
+(def ^:private default-attrition
+  {:kill-interval   15   ; secs between sequential kills
+   :survivor-secs   60   ; hold with one survivor
+   :revive-interval 15}) ; secs between sequential revives
+
+(defn- attrition-schedule
+  "Returns [victims-in-kill-order survivor-node] given the test's node
+  list. Last node sorted is preserved as the survivor — deterministic
+  across runs, which keeps logs and Jepsen replay reproducible."
+  [nodes]
+  (let [sorted (vec (sort nodes))]
+    [(butlast sorted) (last sorted)]))
+
+(defn attrition-generator
+  "Generates per-node kill/start ops on the attrition schedule. The
+  victim sequence is deterministic (sorted ascending, last node
+  reserved as the survivor) so logs and Jepsen history replay are
+  reproducible."
+  [nodes
+   {:keys [kill-interval survivor-secs revive-interval]
+    :or   {kill-interval   (:kill-interval default-attrition)
+           survivor-secs   (:survivor-secs default-attrition)
+           revive-interval (:revive-interval default-attrition)}}]
+  (let [[victims survivor] (attrition-schedule nodes)
+        kill-ops   (mapcat (fn [v]
+                             [{:type :info :f :kill :value [v]}
+                              (gen/sleep kill-interval)])
+                           victims)
+        revive-ops (mapcat (fn [v]
+                             [{:type :info :f :start :value [v]}
+                              (gen/sleep revive-interval)])
+                           victims)]
+    (info "attrition: survivor node will be" survivor
+          "; victims in kill order:" (vec victims))
+    (apply gen/phases
+           (concat kill-ops
+                   [(gen/sleep survivor-secs)]
+                   revive-ops))))
+
+(defn attrition-package
+  "Nemesis package shaped like a kill-pkg but carrying the full
+  attrition schedule. Reuses jepsen.nemesis.combined/db-nemesis,
+  which already knows how to dispatch :kill/:start ops by node spec
+  (a literal node list, in our case)."
+  [db opts]
+  {:nemesis         (nc/db-nemesis db)
+   :generator       (attrition-generator (:nodes opts) opts)
+   :final-generator {:type :info :f :start :value :all}
+   :perf            #{{:name  "kill"
+                       :start #{:kill}
+                       :stop  #{:start}
+                       :color "#E9A4A0"}}})
+
+(defn attrition-nemesis
+  "Returns the nemesis-config map for the attrition test. fault-pkg
+  is intentionally empty — partitions would muddle the bootstrap
+  signal we're trying to isolate."
+  [db opts]
+  {:kill-pkg  (attrition-package db opts)
+   :fault-pkg nil})
+
+(defn attrition-phase-generator
+  "Phase orchestration for attrition tests. Skips the standard
+  partition phases and gives the attrition schedule enough wall-clock
+  to actually fire all its kills + survivor hold + revives. Total
+  attrition runtime is N*(kill-interval+revive-interval) +
+  survivor-secs; tests should set --time-limit accordingly.
+
+  Phases:
+    1. Normal ops for `normal-secs` (warms the cluster, lets bootstrap settle)
+    2. Attrition (kills + survivor + revives) running in parallel with client ops
+    3. Settle for `settle-secs` (gives anti-entropy / re-bootstrapped nodes time to converge)
+    4. Final reads"
+  [{:keys [normal-secs settle-secs]
+    :or   {normal-secs 20
+           settle-secs 30}}
+   nemesis-pkg client-gen final-gen]
+  (let [kill-pkg (:kill-pkg nemesis-pkg)]
+    (gen/phases
+      ;; Phase 1: normal ops
+      (gen/clients (gen/time-limit normal-secs client-gen))
+
+      ;; Phase 2: attrition + client ops in parallel
+      (->> client-gen
+           (gen/nemesis (:generator kill-pkg)))
+
+      ;; Phase 3: make sure any still-down nodes get a final start, then settle
+      (gen/nemesis (:final-generator kill-pkg))
+      (gen/clients (gen/time-limit settle-secs client-gen))
+
+      ;; Phase 4: brief quiet window
+      (gen/sleep 5)
+
+      ;; Phase 5: final reads
+      (when final-gen
+        (gen/clients final-gen)))))
