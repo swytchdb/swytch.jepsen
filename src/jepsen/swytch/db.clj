@@ -210,6 +210,7 @@
                        "--cluster-passphrase"  passphrase
                        "--cluster-port"        (str cluster-port)])
         base-args   (cond-> base-args
+                      (and (= subcommand "redis") (:ssi test)) (conj "--ssi")
                       join-dns     (into ["--join" join-dns])
                       (:debug test) (into [(if (= subcommand "sql") "-v" "--debug")]))]
     (info "Starting Swytch" subcommand "on" node

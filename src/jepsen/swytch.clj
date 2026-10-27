@@ -16,6 +16,7 @@
             [jepsen.swytch.os :as swytch-os]
             [jepsen.swytch.workload.counter :as counter]
             [jepsen.swytch.workload.elle-causal :as elle-causal]
+            [jepsen.swytch.workload.elle-ssi :as elle-ssi]
             [jepsen.swytch.workload.set :as set-wl]
             [jepsen.swytch.workload.sorted-set :as sorted-set]
             [jepsen.swytch.workload.sql-append :as sql-append]))
@@ -29,6 +30,7 @@
    :set          {:transport :redis :fn set-wl/workload}
    :sorted-set   {:transport :redis :fn sorted-set/workload}
    :elle-causal  {:transport :redis :fn elle-causal/workload}
+   :elle-ssi     {:transport :redis :ssi true :fn elle-ssi/workload}
    :sql-append   {:transport :sql   :fn sql-append/workload}})
 
 (def nemesis-configs
@@ -65,7 +67,8 @@
                                                  {:available (keys workloads)})))
         transport               (:transport workload-entry)
         workload-fn             (:fn workload-entry)
-        opts                    (assoc opts :transport transport)
+        opts                    (assoc opts :transport transport
+                                            :ssi (boolean (:ssi workload-entry)))
         db                      (sdb/db opts)
         workload                (workload-fn opts)
         nemesis-name    (keyword (:nemesis-config opts "safe"))
@@ -137,7 +140,7 @@
     :default "../swytch"]
    [nil "--swytch-binary PATH" "Path to a pre-built Swytch binary (skips build)"
     :default nil]
-   [nil "--workload NAME" "Workload to run: counter, set, sorted-set, elle-causal, sql-append"
+   [nil "--workload NAME" "Workload to run: counter, set, sorted-set, elle-causal, elle-ssi, sql-append"
     :default "counter"]
    [nil "--nemesis-config NAME" "Nemesis config: none, safe, attrition"
     :default "safe"]
