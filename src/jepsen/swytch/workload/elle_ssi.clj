@@ -3,7 +3,8 @@
 
   No WATCH, Lua, or client-side retries: conflict detection must come from
   SSI itself. Reads are observed before EXEC on the MULTI snapshot, and are
-  recorded as committed only after EXEC succeeds. A passing finite history
+  recorded as committed only after EXEC succeeds. Final observations use
+  independent, non-transactional reads of each key. A passing finite history
   is evidence of serializability, not a proof for all possible executions."
   (:require [elle.list-append :as elle]
             [jepsen [checker :as checker]
@@ -63,6 +64,21 @@
                   (car/with-replies (car/redis-call command)))
                 txn))))
 
+(defn run-final-read!
+  "One ordinary LRANGE is one Elle operation; never imply multi-key atomicity."
+  [command! txn]
+  (require-reply! #(and (= 1 (count %)) (= :r (ffirst %))) txn)
+  (let [[[_ k _]] txn
+        reply (require-reply! vector? (command! ["LRANGE" (redis-key k) 0 -1]))]
+    [[:r k (mapv #(require-reply! integer? (parse-long (str %))) reply)]]))
+
+(defn exec-final-read [conn txn]
+  (car/wcar (assoc conn :pool :none)
+    (car/return
+      (run-final-read! (fn [command]
+                         (car/with-replies (car/redis-call command)))
+                       txn))))
+
 (defrecord SSIClient [conn node]
   client/Client
   (open! [this test node]
@@ -75,7 +91,8 @@
   (invoke! [_ _ op]
     (let [op (assoc op :node node)]
       (try
-        (if-let [value (exec-txn conn (:value op))]
+        (if-let [value ((if (:final-read op) exec-final-read exec-txn)
+                       conn (:value op))]
           (assoc op :type :ok :value value)
           (assoc op :type :fail :error :ssi-conflict))
         ;; A lost EXEC reply may have committed. Keep the original append
@@ -112,8 +129,10 @@
 
 (defn final-reads []
   (gen/each-thread
-    (gen/once {:type :invoke :f :txn :final-read true
-               :value (mapv (fn [k] [:r k nil]) (range key-count))})))
+    (map (fn [k]
+           (gen/once {:type :invoke :f :txn :final-read true
+                      :value [[:r k nil]]}))
+         (range key-count))))
 
 (defn coverage-checker
   "An all-aborted run, a disabled SSI flag, or missing final observations must
@@ -124,15 +143,22 @@
       (let [oks (filter #(and (= :ok (:type %)) (= :txn (:f %))) history)
             mixed (count (filter #(let [fs (set (map first (:value %)))]
                                     (and (fs :r) (fs :append))) oks))
-            observed (set (map :node (filter :final-read oks)))
-            missing (vec (remove observed (:nodes test)))
+            observed (set (for [op (filter :final-read oks)
+                                [f k _] (:value op)
+                                :when (= :r f)]
+                            [(:node op) k]))
+            missing (vec (for [node (:nodes test)
+                               k (range key-count)
+                               :when (not (observed [node k]))]
+                           [node k]))
             protocol-errors (vec (filter #(= :ssi-protocol-error (:error %)) history))]
         {:valid? (cond
                    (seq protocol-errors) false
                    (or (zero? mixed) (seq missing)) :unknown
                    :else true)
          :committed-mixed-txns mixed
-         :missing-final-read-nodes missing
+         :missing-final-read-nodes (vec (distinct (map first missing)))
+         :missing-final-reads missing
          :protocol-errors protocol-errors}))))
 
 (defn elle-checker []
